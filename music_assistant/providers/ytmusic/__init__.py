@@ -226,8 +226,8 @@ class YoutubeMusicProvider(MusicProvider):
                 break
         else:
             self.language = "en"
-        if not await self._user_has_ytm_premium():
-            raise LoginFailed("User does not have Youtube Music Premium")
+        #if not await self._user_has_ytm_premium():
+        #    raise LoginFailed("User does not have Youtube Music Premium")
 
     @use_cache(3600 * 24 * 7)  # Cache for 7 days
     async def search(
