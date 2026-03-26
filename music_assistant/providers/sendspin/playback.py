@@ -634,51 +634,65 @@ class SendspinPlaybackSession:
         # Shadow deque mirroring pending_chunks for join-catchup backlog peeking.
         pending_backlog: deque[_PendingChunk] = deque()
         pending_duration_us = 0
+        last_elapsed_update_s = 0.0
 
         async def _produce_pending_chunks() -> None:
             nonlocal pending_duration_us
             audio_source = self.player.mass.streams.get_stream(
                 media, _PCM_FORMAT, self.player.player_id
             )
-            async for chunk in audio_source:
-                if not chunk:
-                    continue
-                for slice_chunk in self._iter_pcm_slices(chunk, _PCM_FORMAT, _PRODUCER_SLICE_US):
-                    if not slice_chunk:
+            completed = False
+            try:
+                async for chunk in audio_source:
+                    if not chunk:
                         continue
-                    duration_us = self._duration_us(slice_chunk, _PCM_FORMAT)
-                    if duration_us <= 0:
-                        continue
-                    await self._refresh_member_mappings()
-                    pending = _PendingChunk(pcm=slice_chunk, duration_us=duration_us)
-                    await pending_chunks.put(pending)
-                    pending_backlog.append(pending)
-                    pending_duration_us += duration_us
-                    join_pending_ids, pipelines = await self._snapshot_active_pipelines()
-                    transform_pipelines: list[_MemberPipeline] = []
-                    for member_id, pipeline in pipelines:
-                        if not pipeline.config.requires_transform:
+                    for slice_chunk in self._iter_pcm_slices(
+                        chunk, _PCM_FORMAT, _PRODUCER_SLICE_US
+                    ):
+                        if not slice_chunk:
                             continue
-                        if member_id in join_pending_ids:
+                        duration_us = self._duration_us(slice_chunk, _PCM_FORMAT)
+                        if duration_us <= 0:
                             continue
-                        transform_pipelines.append(pipeline)
-                    results = await asyncio.gather(
-                        *(
-                            self._transform_member_chunk(pipeline, slice_chunk)
-                            for pipeline in transform_pipelines
-                        ),
-                        return_exceptions=True,
-                    )
-                    for pipeline, result in zip(transform_pipelines, results, strict=True):
-                        if isinstance(result, BaseException):
-                            self.player.logger.warning(
-                                "Transform push failed for channel %s: %s",
-                                pipeline.channel_id,
-                                result,
-                            )
+                        await self._refresh_member_mappings()
+                        pending = _PendingChunk(pcm=slice_chunk, duration_us=duration_us)
+                        await pending_chunks.put(pending)
+                        pending_backlog.append(pending)
+                        pending_duration_us += duration_us
+                        join_pending_ids, pipelines = await self._snapshot_active_pipelines()
+                        transform_pipelines: list[_MemberPipeline] = []
+                        for member_id, pipeline in pipelines:
+                            if not pipeline.config.requires_transform:
+                                continue
+                            if member_id in join_pending_ids:
+                                continue
+                            transform_pipelines.append(pipeline)
+                        results = await asyncio.gather(
+                            *(
+                                self._transform_member_chunk(pipeline, slice_chunk)
+                                for pipeline in transform_pipelines
+                            ),
+                            return_exceptions=True,
+                        )
+                        for pipeline, result in zip(transform_pipelines, results, strict=True):
+                            if isinstance(result, BaseException):
+                                self.player.logger.warning(
+                                    "Transform push failed for channel %s: %s",
+                                    pipeline.channel_id,
+                                    result,
+                                )
+                completed = True
+            finally:
+                if not completed:
+                    close_task = asyncio.create_task(audio_source.aclose())
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        await close_task
+                        raise
 
         async def _commit_pending_chunks() -> None:
-            nonlocal pending_duration_us
+            nonlocal pending_duration_us, last_elapsed_update_s
             while True:
                 pending = await pending_chunks.get()
                 if pending is None:
@@ -738,6 +752,13 @@ class SendspinPlaybackSession:
                     self._produced_audio_us += pending.duration_us
                     self._prune_history_locked(commit_now_us)
                 await self._fanout_history_chunk_to_join_processors(committed_history_chunk)
+                if self._timeline_start_us is not None:
+                    elapsed_real_s = max(0.0, (commit_now_us - self._timeline_start_us) / 1_000_000)
+                    if elapsed_real_s - last_elapsed_update_s >= 1.0:
+                        last_elapsed_update_s = elapsed_real_s
+                        self.player._attr_elapsed_time = elapsed_real_s
+                        self.player._attr_elapsed_time_last_updated = time.time()
+                        self.player.update_state()
 
         commit_task = asyncio.create_task(_commit_pending_chunks())
         self._attach_task_exception_logger(commit_task, "commit_pending_chunks")
