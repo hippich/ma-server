@@ -43,6 +43,7 @@ See also our general DEVELOPMENT.md guide in the repository for more information
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from music_assistant_models.enums import ContentType, MediaType, ProviderFeature, StreamType
@@ -337,6 +338,9 @@ class MyDemoMusicprovider(MusicProvider):
         # to avoid too many calls to the provider's API.
         # You can use the @use_cache decorator from music_assistant.controllers.cache
         # to easily apply caching to this method.
+        # As this returns a collection that also serves as good fallback data, decorate it with
+        # allow_expired_cache=True, e.g. @use_cache(3600 * 24, allow_expired_cache=True).
+        # That serves the stale result instantly while refreshing it in the background.
 
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:  # type: ignore[empty-body]
         """Get a list of most popular tracks for the given artist."""
@@ -347,6 +351,9 @@ class MyDemoMusicprovider(MusicProvider):
         # to avoid too many calls to the provider's API.
         # You can use the @use_cache decorator from music_assistant.controllers.cache
         # to easily apply caching to this method.
+        # As this returns a collection that also serves as good fallback data, decorate it with
+        # allow_expired_cache=True, e.g. @use_cache(3600 * 24, allow_expired_cache=True).
+        # That serves the stale result instantly while refreshing it in the background.
 
     async def get_album(self, prov_album_id: str) -> Album:  # type: ignore[empty-body]
         """Get full album details by id."""
@@ -395,6 +402,9 @@ class MyDemoMusicprovider(MusicProvider):
         # to avoid too many calls to the provider's API.
         # You can use the @use_cache decorator from music_assistant.controllers.cache
         # to easily apply caching to this method.
+        # As this returns a collection that also serves as good fallback data, decorate it with
+        # allow_expired_cache=True, e.g. @use_cache(3600 * 24, allow_expired_cache=True).
+        # That serves the stale result instantly while refreshing it in the background.
 
     async def get_playlist_tracks(  # type: ignore[empty-body]
         self,
@@ -408,6 +418,9 @@ class MyDemoMusicprovider(MusicProvider):
         # to avoid too many calls to the provider's API.
         # You can use the @use_cache decorator from music_assistant.controllers.cache
         # to easily apply caching to this method.
+        # As this returns a collection that also serves as good fallback data, decorate it with
+        # allow_expired_cache=True, e.g. @use_cache(3600 * 3, allow_expired_cache=True).
+        # That serves the stale result instantly while refreshing it in the background.
 
     async def library_add(self, item: MediaItemType) -> bool:
         """Add item to provider's library. Return true on success."""
@@ -448,8 +461,13 @@ class MyDemoMusicprovider(MusicProvider):
         # to avoid too many calls to the provider's API.
         # You can use the @use_cache decorator from music_assistant.controllers.cache
         # to easily apply caching to this method.
+        # As this returns a collection that also serves as good fallback data, decorate it with
+        # allow_expired_cache=True, e.g. @use_cache(3600 * 24, allow_expired_cache=True).
+        # That serves the stale result instantly while refreshing it in the background.
 
-    async def get_resume_position(self, item_id: str, media_type: MediaType) -> tuple[bool, int]:  # type: ignore[empty-body]
+    async def get_resume_position(  # type: ignore[empty-body]
+        self, item_id: str, media_type: MediaType
+    ) -> tuple[bool, int, datetime | None]:
         """
         Get progress (resume point) details for the given Audiobook or Podcast episode.
 
@@ -460,7 +478,8 @@ class MyDemoMusicprovider(MusicProvider):
         Will be called right before playback starts to ensure the resume position is correct.
 
         Returns a boolean with the fully_played status
-        and an integer with the resume position in ms.
+        and an integer with the resume position in ms,
+        and an optional timestamp as datetime when this resume position was set.
         """
         # optional function to get the resume position of a audiobook or podcast episode
         # only implement this if your provider supports providing this information!
@@ -474,6 +493,10 @@ class MyDemoMusicprovider(MusicProvider):
         # podcasts or audiobooks, this may as well be an episode or chapter id.
         # You should return a StreamDetails object here with the info as accurate as possible
         # to allow Music Assistant to process the audio using ffmpeg.
+        # IMPORTANT: Streaming providers (ie. is_streaming_provider = True) are NOT allowed
+        # to cache any audio data from the provider locally. Streaming providers must always
+        # return a valid stream url in the StreamDetails with an optional encryption key in
+        # case  of encrypted streams.
         return StreamDetails(
             provider=self.instance_id,
             item_id=item_id,
