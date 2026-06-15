@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from music_assistant_models.enums import AlbumType, ProviderFeature
 from music_assistant_models.errors import InvalidDataError
-from music_assistant_models.media_items import ProviderMapping, Track
+from music_assistant_models.media_items import Playlist, ProviderMapping, Track
+from music_assistant_models.media_items.metadata import MediaItemMetadata
 
 from music_assistant.constants import DYNAMIC_PLAYLIST_SAMPLE_SIZE
+from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.smart_playlist import (
+    CONF_AI_DESCRIPTIONS,
     SmartPlaylistProvider,
 )
 from music_assistant.providers.smart_playlist.helpers import (
     LOGIC_AND,
     LOGIC_OR,
+    RULES_FILENAME,
     SmartPlaylistRules,
+    write_json,
 )
 
 # ---------------------------------------------------------------------------
@@ -981,3 +989,621 @@ async def test_count_tracks_returns_count_and_duration(tmp_path: Any) -> None:
     result = await plugin.count_tracks(SmartPlaylistRules(limit=10).to_dict())
     assert result["count"] == 3
     assert result["duration_seconds"] == 600
+
+
+# ---------------------------------------------------------------------------
+# album_type filter tests
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_track_with_album_type(
+    item_id: str,
+    uri: str,
+    album_type: str = "unknown",
+) -> MagicMock:
+    """Build a minimal mock Track with a unique album.item_id per item_id."""
+    track = _make_mock_track(item_id, uri)
+    track.album = MagicMock()
+    # Unique album ID per track (item_id "1" → album "1000") so library_items mocks are precise.
+    track.album.item_id = str(int(item_id) * 1000)
+    track.album.year = None
+    track.album.album_type = AlbumType(album_type)
+    return track
+
+
+class TestSmartPlaylistRulesAlbumType:
+    """Tests for album_types / excluded_album_types fields on SmartPlaylistRules."""
+
+    def test_album_types_defaults_to_empty(self) -> None:
+        """album_types and excluded_album_types default to empty lists."""
+        rules = SmartPlaylistRules()
+        assert rules.album_types == []
+        assert rules.excluded_album_types == []
+
+    def test_album_types_round_trip(self) -> None:
+        """album_types / excluded_album_types survive a to_dict / from_dict round-trip."""
+        rules = SmartPlaylistRules(
+            album_types=["album", "ep"],
+            excluded_album_types=["single", "compilation"],
+        )
+        recovered = SmartPlaylistRules.from_dict(rules.to_dict())
+        assert recovered.album_types == ["album", "ep"]
+        assert recovered.excluded_album_types == ["single", "compilation"]
+
+    def test_old_json_without_album_types_loads_cleanly(self) -> None:
+        """Rules JSON without album_types fields deserializes with empty defaults."""
+        rules = SmartPlaylistRules.from_dict({"limit": 50, "favorites_only": True})
+        assert rules.album_types == []
+        assert rules.excluded_album_types == []
+
+    def test_human_readable_includes_album_types(self) -> None:
+        """human_readable mentions album_types when set."""
+        rules = SmartPlaylistRules(album_types=["album", "ep"])
+        summary = rules.human_readable()
+        assert "album" in summary
+        assert "ep" in summary
+
+    def test_human_readable_includes_excluded_album_types(self) -> None:
+        """human_readable mentions excluded_album_types when set."""
+        rules = SmartPlaylistRules(excluded_album_types=["single"])
+        assert "single" in rules.human_readable()
+
+
+class TestAlbumTypeValidation:
+    """Tests for album_type validation in validate_rules."""
+
+    def _make_plugin(self) -> SmartPlaylistProvider:
+        mass = MagicMock()
+        manifest = MagicMock()
+        manifest.domain = "smart_playlist"
+        config = MagicMock()
+        config.get_value.return_value = "GLOBAL"
+        return SmartPlaylistProvider(mass, manifest, config, set())
+
+    def test_valid_album_types_pass(self) -> None:
+        """All AlbumType values are valid."""
+        plugin = self._make_plugin()
+        rules = SmartPlaylistRules(
+            album_types=["album", "single", "ep", "live", "soundtrack", "compilation"]
+        )
+        plugin._validate_rules(rules)  # must not raise
+
+    def test_invalid_album_type_raises(self) -> None:
+        """Unknown album_type value raises InvalidDataError."""
+        plugin = self._make_plugin()
+        rules = SmartPlaylistRules(album_types=["not_a_real_type"])
+        with pytest.raises(InvalidDataError, match="album_types"):
+            plugin._validate_rules(rules)
+
+    def test_invalid_excluded_album_type_raises(self) -> None:
+        """Unknown excluded_album_type value raises InvalidDataError."""
+        plugin = self._make_plugin()
+        rules = SmartPlaylistRules(excluded_album_types=["bogus"])
+        with pytest.raises(InvalidDataError, match="excluded_album_types"):
+            plugin._validate_rules(rules)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_rules_album_types_filter() -> None:
+    """album_types filter keeps only tracks whose album ID is in the allowed set."""
+    mass = MagicMock()
+    manifest = MagicMock()
+    manifest.domain = "smart_playlist"
+    config = MagicMock()
+    config.get_value.return_value = "GLOBAL"
+    plugin = SmartPlaylistProvider(mass, manifest, config, set())
+
+    album_track = _make_mock_track_with_album_type("1", "library://track/1", "album")
+    single_track = _make_mock_track_with_album_type("2", "library://track/2", "single")
+    unknown_track = _make_mock_track_with_album_type("3", "library://track/3", "unknown")
+
+    for t in (album_track, single_track, unknown_track):
+        t.available = True
+        t.last_played = 0
+        t.metadata = MagicMock()
+        t.metadata.genres = None
+
+    cast("Any", plugin)._get_library_tracks = AsyncMock(
+        return_value=[album_track, single_track, unknown_track]
+    )
+    # albums.library_items returns only the "album" type album (album_track.album.item_id = "1000")
+    mock_album = MagicMock()
+    mock_album.item_id = "1000"
+    mass.music.albums.library_items = AsyncMock(return_value=[mock_album])
+
+    rules = SmartPlaylistRules(album_types=["album"], limit=10)
+    result = await plugin._evaluate_rules(rules)
+    uris = [t.uri for t in result]
+    assert "library://track/1" in uris  # album → included
+    assert "library://track/2" not in uris  # single → excluded
+    assert "library://track/3" not in uris  # unknown album type → excluded
+
+
+@pytest.mark.asyncio
+async def test_evaluate_rules_excluded_album_types_filter() -> None:
+    """excluded_album_types removes tracks whose album.album_type is in the exclusion list."""
+    mass = MagicMock()
+    manifest = MagicMock()
+    manifest.domain = "smart_playlist"
+    config = MagicMock()
+    config.get_value.return_value = "GLOBAL"
+    plugin = SmartPlaylistProvider(mass, manifest, config, set())
+
+    album_track = _make_mock_track_with_album_type("1", "library://track/1", "album")
+    single_track = _make_mock_track_with_album_type("2", "library://track/2", "single")
+
+    for t in (album_track, single_track):
+        t.available = True
+        t.last_played = 0
+        t.metadata = MagicMock()
+        t.metadata.genres = None
+
+    cast("Any", plugin)._get_library_tracks = AsyncMock(return_value=[album_track, single_track])
+    # albums.library_items returns only the "single" type album (single_track.album.item_id = "2000")
+    mock_album = MagicMock()
+    mock_album.item_id = "2000"
+    mass.music.albums.library_items = AsyncMock(return_value=[mock_album])
+
+    rules = SmartPlaylistRules(excluded_album_types=["single"], limit=10)
+    result = await plugin._evaluate_rules(rules)
+    uris = [t.uri for t in result]
+    assert "library://track/1" in uris  # album → kept
+    assert "library://track/2" not in uris  # single → excluded
+
+
+@pytest.mark.asyncio
+async def test_seed_mode_album_types_filter_is_applied() -> None:
+    """album_types filter is enforced in seed mode via _apply_seed_post_filters."""
+    mass = MagicMock()
+    mass.music.genres.get_library_item = AsyncMock(side_effect=Exception("not called"))
+    manifest = MagicMock()
+    manifest.domain = "smart_playlist"
+    config = MagicMock()
+    config.get_value.return_value = "GLOBAL"
+    plugin = SmartPlaylistProvider(mass, manifest, config, set())
+
+    album_track = _make_mock_track_with_album_type("1", "library://track/1", "album")
+    single_track = _make_mock_track_with_album_type("2", "library://track/2", "single")
+
+    for t in (album_track, single_track):
+        t.available = True
+        t.last_played = 0
+        t.metadata = MagicMock()
+        t.metadata.popularity = None
+        t.metadata.genres = None
+        t.favorite = False
+
+    # Seed mode is triggered when seed_track_uris is non-empty.
+    # Mock _tracks_from_seeds to return mixed album types.
+    cast("Any", plugin)._tracks_from_seeds = AsyncMock(return_value=[album_track, single_track])
+    # albums.library_items returns only the "album" type album (album_track.album.item_id = "1000")
+    mock_album = MagicMock()
+    mock_album.item_id = "1000"
+    mass.music.albums.library_items = AsyncMock(return_value=[mock_album])
+
+    rules = SmartPlaylistRules(
+        seed_track_uris=["library://track/99"],
+        album_types=["album"],
+        limit=10,
+    )
+    result = await plugin._evaluate_rules(rules)
+    uris = [t.uri for t in result]
+    assert "library://track/1" in uris  # album → kept
+    assert "library://track/2" not in uris  # single → filtered out by _apply_seed_post_filters
+
+
+# ---------------------------------------------------------------------------
+# AI-generated description tests
+# ---------------------------------------------------------------------------
+
+
+def _make_ai_provider(response: str = "A mellow mix for the evening.") -> MagicMock:
+    """Build a mock plugin provider that supports ai_query and returns the given response."""
+    provider = MagicMock(spec=PluginProvider)
+    provider.ai_query = AsyncMock(return_value=response)
+    return provider
+
+
+def _make_ai_plugin(
+    tmp_path: Any,
+    *,
+    ai_enabled: bool = True,
+    ai_provider: Any = None,
+) -> SmartPlaylistProvider:
+    """Build a SmartPlaylistProvider wired for AI-description tests."""
+    mass = MagicMock()
+    mass.storage_path = str(tmp_path)
+    mass.cache.clear = AsyncMock()
+    mass.metadata.locale = "en_US"
+    providers = [ai_provider] if ai_provider is not None else []
+    mass.get_providers_supporting_feature = MagicMock(return_value=providers)
+    manifest = MagicMock()
+    manifest.domain = "smart_playlist"
+    config = MagicMock()
+    config.get_value.side_effect = lambda key, *_args: (
+        ai_enabled if key == CONF_AI_DESCRIPTIONS else "GLOBAL"
+    )
+    return SmartPlaylistProvider(mass, manifest, config, set())
+
+
+def _make_library_item(plugin: SmartPlaylistProvider, prov_id: str, db_id: int = 7) -> MagicMock:
+    """Build a mock library playlist item mapped back to the given provider id."""
+    mapping = MagicMock()
+    mapping.provider_instance = plugin.instance_id
+    mapping.item_id = prov_id
+    library_item = MagicMock()
+    library_item.item_id = db_id
+    library_item.provider_mappings = [mapping]
+    return library_item
+
+
+def _capture_scheduled(names: list[str]) -> Any:
+    """Return a create_task side-effect that records scheduled coroutine names and closes them."""
+
+    def _side_effect(coro: Any, **_: Any) -> None:
+        names.append(coro.cr_code.co_name)
+        coro.close()
+
+    return _side_effect
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_description_uses_provider(tmp_path: Any) -> None:
+    """When enabled and a provider is available, the AI response is returned."""
+    ai_provider = _make_ai_provider("Chill evening vibes.")
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=True, ai_provider=ai_provider)
+
+    rules = SmartPlaylistRules(favorites_only=True)
+    result = await plugin._generate_ai_description("Evening Chill", rules)
+
+    assert result == "Chill evening vibes."
+    ai_provider.ai_query.assert_awaited_once()
+    prompt = ai_provider.ai_query.await_args.args[0]
+    assert "Evening Chill" in prompt
+    assert "Favorites only" in prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_description_includes_locale(tmp_path: Any) -> None:
+    """The configured locale is passed to the provider so it answers in that language."""
+    ai_provider = _make_ai_provider("Een rustige mix voor de avond.")
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=True, ai_provider=ai_provider)
+    cast("Any", plugin.mass).metadata.locale = "nl_NL"
+
+    await plugin._generate_ai_description("Avond Chill", SmartPlaylistRules(favorites_only=True))
+
+    prompt = ai_provider.ai_query.await_args.args[0]
+    assert "nl_NL" in prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_description_disabled_returns_none(tmp_path: Any) -> None:
+    """With the toggle off, the AI provider is never called."""
+    ai_provider = _make_ai_provider()
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=False, ai_provider=ai_provider)
+
+    result = await plugin._generate_ai_description("X", SmartPlaylistRules())
+
+    assert result is None
+    ai_provider.ai_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_description_no_provider_returns_none(tmp_path: Any) -> None:
+    """With no AI_QUERY provider available, None is returned."""
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=True, ai_provider=None)
+
+    result = await plugin._generate_ai_description("X", SmartPlaylistRules())
+
+    assert result is None
+    cast("Any", plugin.mass).get_providers_supporting_feature.assert_called_once_with(
+        ProviderFeature.AI_QUERY
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_description_provider_error_returns_none(tmp_path: Any) -> None:
+    """A failing AI provider falls back to None instead of raising."""
+    ai_provider = MagicMock(spec=PluginProvider)
+    ai_provider.ai_query = AsyncMock(side_effect=Exception("boom"))
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=True, ai_provider=ai_provider)
+
+    result = await plugin._generate_ai_description("X", SmartPlaylistRules(favorites_only=True))
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_description_falls_back_to_next_provider(tmp_path: Any) -> None:
+    """If the first provider errors, the next available provider is tried."""
+    bad = MagicMock(spec=PluginProvider)
+    bad.ai_query = AsyncMock(side_effect=Exception("boom"))
+    good = _make_ai_provider("Second provider result.")
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=True)
+    cast("Any", plugin.mass).get_providers_supporting_feature = MagicMock(return_value=[bad, good])
+
+    result = await plugin._generate_ai_description("X", SmartPlaylistRules(favorites_only=True))
+
+    assert result == "Second provider result."
+    bad.ai_query.assert_awaited_once()
+    good.ai_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_disabled_toggle_does_not_schedule_refresh(tmp_path: Any) -> None:
+    """With the toggle off, creating a playlist schedules no background AI refresh."""
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=False)
+    await plugin.handle_async_init()
+    mass = cast("Any", plugin.mass)
+    mass.music.playlists.add_item_to_library = AsyncMock(return_value=MagicMock())
+    scheduled: list[str] = []
+    mass.create_task = MagicMock(side_effect=_capture_scheduled(scheduled))
+
+    await plugin.create_smart_playlist("Evening Chill", {"favorites_only": True})
+
+    assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_description_blank_response_returns_none(tmp_path: Any) -> None:
+    """A blank/whitespace AI response is treated as no description."""
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=True, ai_provider=_make_ai_provider("   "))
+
+    result = await plugin._generate_ai_description("X", SmartPlaylistRules(favorites_only=True))
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_build_playlist_uses_stored_ai_description(tmp_path: Any) -> None:
+    """_build_playlist uses the stored AI description verbatim (no prefix)."""
+    plugin = _make_ai_plugin(tmp_path)
+    await plugin.handle_async_init()
+    plugin._names_store["abc"] = "My List"
+    plugin._descriptions_store["abc"] = "Hand-crafted AI summary."
+
+    playlist = plugin._build_playlist("abc", SmartPlaylistRules(favorites_only=True))
+
+    assert playlist.metadata.description == "Hand-crafted AI summary."
+
+
+@pytest.mark.asyncio
+async def test_build_playlist_ignores_stored_description_when_disabled(tmp_path: Any) -> None:
+    """With the toggle off, a stored AI description is ignored in favour of the summary."""
+    plugin = _make_ai_plugin(tmp_path, ai_enabled=False)
+    await plugin.handle_async_init()
+    plugin._names_store["abc"] = "My List"
+    plugin._descriptions_store["abc"] = "Old AI text."
+    rules = SmartPlaylistRules(favorites_only=True)
+
+    playlist = plugin._build_playlist("abc", rules)
+
+    assert playlist.metadata.description == f"[Smart Playlist] {rules.human_readable()}"
+
+
+@pytest.mark.asyncio
+async def test_build_playlist_falls_back_to_human_readable(tmp_path: Any) -> None:
+    """Without a stored AI description, _build_playlist uses the mechanical summary."""
+    plugin = _make_ai_plugin(tmp_path)
+    await plugin.handle_async_init()
+    plugin._names_store["abc"] = "My List"
+    rules = SmartPlaylistRules(favorites_only=True)
+
+    playlist = plugin._build_playlist("abc", rules)
+
+    assert playlist.metadata.description == f"[Smart Playlist] {rules.human_readable()}"
+
+
+@pytest.mark.asyncio
+async def test_ai_description_persists_to_disk(tmp_path: Any) -> None:
+    """A stored AI description survives a plugin reload."""
+    rules_dir = tmp_path / "smart_playlists"
+    rules_dir.mkdir()
+
+    plugin = _make_ai_plugin(tmp_path)
+    await plugin.handle_async_init()
+    plugin._rules_dir = str(rules_dir)
+    plugin._names_store["42"] = "Name"
+    plugin._descriptions_store["42"] = "Persisted AI text."
+    await plugin._save_rules("42", SmartPlaylistRules(genre_ids=[1]))
+
+    plugin2 = _make_ai_plugin(tmp_path)
+    await plugin2.handle_async_init()
+    plugin2._rules_dir = str(rules_dir)
+    plugin2._rules_store = {}
+    plugin2._names_store = {}
+    plugin2._descriptions_store = {}
+    await plugin2._load_rules_from_disk()
+
+    assert plugin2._descriptions_store.get("42") == "Persisted AI text."
+
+
+@pytest.mark.asyncio
+async def test_write_json_preserves_original_on_failure(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed atomic replace must leave the existing file intact, never truncated."""
+    target = tmp_path / "rules.json"
+    await write_json(str(target), {"value": "original"})
+
+    def _boom(*_: Any, **__: Any) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("music_assistant.providers.smart_playlist.helpers.Path.replace", _boom)
+    with pytest.raises(OSError, match="replace failed"):
+        await write_json(str(target), {"value": "new"})
+
+    assert json.loads(target.read_text()) == {"value": "original"}
+    # The temp file must be cleaned up so it can't accumulate on repeated failures.
+    assert not (tmp_path / "rules.json.tmp").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_json_cleans_temp_on_cancellation(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during the write must not leave a temp file behind or corrupt the original."""
+    target = tmp_path / "rules.json"
+    await write_json(str(target), {"value": "original"})
+
+    def _cancel(*_: Any, **__: Any) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("music_assistant.providers.smart_playlist.helpers.Path.replace", _cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await write_json(str(target), {"value": "new"})
+
+    assert json.loads(target.read_text()) == {"value": "original"}
+    assert not (tmp_path / "rules.json.tmp").exists()
+
+
+@pytest.mark.asyncio
+async def test_update_playlist_description_skips_when_unchanged(tmp_path: Any) -> None:
+    """No library write/event when the description already matches."""
+    plugin = _make_ai_plugin(tmp_path)
+    await plugin.handle_async_init()
+    existing = MagicMock()
+    existing.metadata.description = "Same text."
+    mass = cast("Any", plugin.mass)
+    mass.music.playlists.get_library_item = AsyncMock(return_value=existing)
+    mass.music.playlists.update_item_in_library = AsyncMock()
+
+    await plugin._update_playlist_description(7, "Same text.")
+
+    mass.music.playlists.update_item_in_library.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_playlist_description_writes_when_changed(tmp_path: Any) -> None:
+    """The library item is rewritten only when the description actually differs."""
+    plugin = _make_ai_plugin(tmp_path)
+    await plugin.handle_async_init()
+    existing = Playlist(
+        item_id="1",
+        provider="library",
+        name="P",
+        provider_mappings={
+            ProviderMapping(item_id="1", provider_domain="library", provider_instance="library")
+        },
+    )
+    existing.metadata = MediaItemMetadata(description="Old text.")
+    mass = cast("Any", plugin.mass)
+    mass.music.playlists.get_library_item = AsyncMock(return_value=existing)
+    mass.music.playlists.update_item_in_library = AsyncMock()
+
+    await plugin._update_playlist_description(7, "New text.")
+
+    mass.music.playlists.update_item_in_library.assert_awaited_once()
+    written = mass.music.playlists.update_item_in_library.await_args.args[1]
+    assert written.metadata.description == "New text."
+
+
+@pytest.mark.asyncio
+async def test_create_smart_playlist_schedules_ai_generation(tmp_path: Any) -> None:
+    """Creating a smart playlist schedules background AI description generation."""
+    plugin = _make_ai_plugin(tmp_path)
+    await plugin.handle_async_init()
+    mass = cast("Any", plugin.mass)
+    mass.music.playlists.add_item_to_library = AsyncMock(return_value=MagicMock())
+    scheduled: list[str] = []
+    mass.create_task = MagicMock(side_effect=_capture_scheduled(scheduled))
+
+    await plugin.create_smart_playlist("Evening Chill", {"favorites_only": True})
+
+    assert scheduled == ["_refresh_ai_description"]
+    # Deduped per playlist so rapid calls don't run concurrent refreshes.
+    kwargs = mass.create_task.call_args.kwargs
+    assert kwargs["task_id"].startswith("smart_playlist_ai_desc_")
+    assert kwargs["abort_existing"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_rules_drops_stale_and_schedules_regeneration(tmp_path: Any) -> None:
+    """Updating rules clears the stale AI description, sets the fallback, and regenerates."""
+    plugin = _make_ai_plugin(tmp_path)
+    await plugin.handle_async_init()
+    plugin._rules_store["abc"] = SmartPlaylistRules(favorites_only=True)
+    plugin._names_store["abc"] = "Name"
+    plugin._descriptions_store["abc"] = "Stale AI text."
+    mass = cast("Any", plugin.mass)
+    scheduled: list[str] = []
+    mass.create_task = MagicMock(side_effect=_capture_scheduled(scheduled))
+    mass.music.playlists.get_library_item_by_prov_id = AsyncMock(
+        return_value=_make_library_item(plugin, "abc")
+    )
+    cast("Any", plugin)._update_playlist_description = AsyncMock()
+
+    await plugin.update_smart_playlist_rules("abc", {"genre_ids": [1]})
+
+    assert "abc" not in plugin._descriptions_store
+    # The stale description must also be invalidated on disk, not just in memory, so it
+    # cannot be reloaded after a restart before the background refresh runs.
+    persisted = json.loads((tmp_path / "smart_playlists" / RULES_FILENAME).read_text())
+    assert persisted["abc"]["ai_description"] is None
+    scheduled_desc = cast("Any", plugin)._update_playlist_description.await_args.args[1]
+    assert scheduled_desc.startswith("[Smart Playlist]")
+    assert scheduled == ["_refresh_ai_description"]
+    assert mass.create_task.call_args.kwargs == {
+        "task_id": "smart_playlist_ai_desc_abc",
+        "abort_existing": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_refresh_ai_description_stores_and_updates(tmp_path: Any) -> None:
+    """The background refresh stores the AI text and pushes it to the library item."""
+    plugin = _make_ai_plugin(tmp_path, ai_provider=_make_ai_provider("Fresh AI summary."))
+    await plugin.handle_async_init()
+    plugin._rules_store["abc"] = SmartPlaylistRules(favorites_only=True)
+    plugin._names_store["abc"] = "Name"
+    cast("Any", plugin.mass).music.playlists.get_library_item_by_prov_id = AsyncMock(
+        return_value=_make_library_item(plugin, "abc")
+    )
+    cast("Any", plugin)._update_playlist_description = AsyncMock()
+
+    await plugin._refresh_ai_description("abc")
+
+    assert plugin._descriptions_store["abc"] == "Fresh AI summary."
+    cast("Any", plugin)._update_playlist_description.assert_awaited_once()
+    assert (
+        cast("Any", plugin)._update_playlist_description.await_args.args[1] == "Fresh AI summary."
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_ai_description_no_provider_uses_fallback(tmp_path: Any) -> None:
+    """With no AI available, the refresh drops any stale text and writes the fallback."""
+    plugin = _make_ai_plugin(tmp_path, ai_provider=None)
+    await plugin.handle_async_init()
+    rules = SmartPlaylistRules(favorites_only=True)
+    plugin._rules_store["abc"] = rules
+    plugin._names_store["abc"] = "Name"
+    plugin._descriptions_store["abc"] = "Stale."
+    cast("Any", plugin.mass).music.playlists.get_library_item_by_prov_id = AsyncMock(
+        return_value=_make_library_item(plugin, "abc")
+    )
+    cast("Any", plugin)._update_playlist_description = AsyncMock()
+
+    await plugin._refresh_ai_description("abc")
+
+    assert "abc" not in plugin._descriptions_store
+    written = cast("Any", plugin)._update_playlist_description.await_args.args[1]
+    assert written == f"[Smart Playlist] {rules.human_readable()}"
+
+
+@pytest.mark.asyncio
+async def test_refresh_ai_description_skips_flush_when_unchanged(tmp_path: Any) -> None:
+    """No rules-file flush when the stored description doesn't change (e.g. no AI provider)."""
+    plugin = _make_ai_plugin(tmp_path, ai_provider=None)
+    await plugin.handle_async_init()
+    plugin._rules_store["abc"] = SmartPlaylistRules(favorites_only=True)
+    plugin._names_store["abc"] = "Name"  # no stored description to begin with
+    cast("Any", plugin)._flush_rules_to_disk = AsyncMock()
+    cast("Any", plugin)._update_playlist_description = AsyncMock()
+    cast("Any", plugin.mass).music.playlists.get_library_item_by_prov_id = AsyncMock(
+        return_value=_make_library_item(plugin, "abc")
+    )
+
+    await plugin._refresh_ai_description("abc")
+
+    cast("Any", plugin)._flush_rules_to_disk.assert_not_awaited()
